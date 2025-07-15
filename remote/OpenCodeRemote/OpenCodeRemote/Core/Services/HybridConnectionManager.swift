@@ -1,454 +1,287 @@
 import Foundation
-import Combine
 import SwiftUI
+import Combine
 
-// Manages both direct and relay connections
 class HybridConnectionManager: ObservableObject {
-    @Published var connectionMode: ConnectionMode = .none
     @Published var isConnected = false
-    @Published var serverURL: URL?
-    @Published var roomCode: String?
     @Published var sessions: [Session] = []
-    @Published var currentSession: Session?
-    @Published var messages: [MessageWithParts] = []
-    @Published var error: String?
-    @Published var connectionState: String = "Disconnected"
+    @Published var connectionError: String?
+    @Published var discoveredInstances: [OpenCodeInstance] = []
+    @Published var isDiscovering = false
     @Published var connectionLogs: [ConnectionLog] = []
     
-    private var directClient: OpenCodeClient?
-    private var relayManager: RelayConnectionManager?
-    private var sseClient: SSEClient?
-    private var cancellables = Set<AnyCancellable>()
-    
-    enum ConnectionMode {
-        case none
-        case direct
-        case relay
+    struct ConnectionLog: Identifiable {
+        let id = UUID()
+        let timestamp: Date
+        let level: LogLevel
+        let message: String
     }
     
-    init() {
-        setupRelayManager()
-    }
-    
-    private func setupRelayManager() {
-        relayManager = RelayConnectionManager()
+    enum LogLevel {
+        case info
+        case warning
+        case error
         
-        // Subscribe to relay state changes
-        relayManager?.$connectionState
-            .sink { [weak self] state in
-                if self?.connectionMode == .relay {
-                    self?.updateConnectionState(for: state)
-                }
+        var color: Color {
+            switch self {
+            case .info: return .green
+            case .warning: return .orange
+            case .error: return .red
             }
-            .store(in: &cancellables)
-        
-        relayManager?.$error
-            .compactMap { $0 }
-            .sink { [weak self] error in
-                self?.error = error
-            }
-            .store(in: &cancellables)
-        
-        relayManager?.$roomCode
-            .sink { [weak self] code in
-                self?.roomCode = code
-            }
-            .store(in: &cancellables)
-        
-        // Handle relay messages
-        relayManager?.onMessage { [weak self] message in
-            self?.handleRelayMessage(message)
         }
     }
     
-    // MARK: - Direct Connection
+    private var webSocketTask: URLSessionWebSocketTask?
+    private var urlSession: URLSession?
+    var baseURL: String
+    private var discoveryTimer: Timer?
+    private var eventSource: EventSource?
     
-    func connectDirect(urlString: String) {
+    init(baseURL: String = "http://localhost:5173") {
+        self.baseURL = baseURL
+        setupURLSession()
+        startDiscovery()
+    }
+    
+    private func setupURLSession() {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 30
+        config.timeoutIntervalForResource = 300
+        urlSession = URLSession(configuration: config, delegate: nil, delegateQueue: .main)
+    }
+    
+    // MARK: - Connection Methods
+    
+    func connect() async {
+        log("Connecting to \(baseURL)...")
+        await connectToURL(baseURL)
+    }
+    
+    private func connectToURL(_ urlString: String) async {
         guard let url = URL(string: urlString) else {
-            error = "Invalid URL"
+            connectionError = "Invalid URL"
             return
         }
         
-        disconnect()
+        // First, verify the server is running by checking /app endpoint
+        let appURL = URL(string: "\(urlString)/app")!
         
-        serverURL = url
-        directClient = OpenCodeClient(baseURL: url)
-        connectionMode = .direct
+        do {
+            log("Checking server at \(appURL)")
+            let (data, response) = try await URLSession.shared.data(from: appURL)
+            
+            guard let httpResponse = response as? HTTPURLResponse,
+                  httpResponse.statusCode == 200 else {
+                connectionError = "Server not responding"
+                log("Server not responding at \(appURL)", level: .error)
+                return
+            }
+            
+            // Parse app info to verify it's OpenCode
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               json["hostname"] != nil && json["path"] != nil {
+                log("Found OpenCode server, connecting to SSE...")
+                // Connect to SSE endpoint
+                await connectToSSE(baseURL: urlString)
+            } else {
+                connectionError = "Not an OpenCode server"
+                log("Not an OpenCode server at \(appURL)", level: .warning)
+            }
+        } catch {
+            connectionError = error.localizedDescription
+            log("Error connecting: \(error.localizedDescription)", level: .error)
+        }
+    }
+    
+    private func connectToSSE(baseURL: String) async {
+        guard let url = URL(string: baseURL) else { return }
+        let eventsURL = url.appendingPathComponent("api/session/events")
+        
+        log("Connecting to SSE at \(eventsURL)")
+        
+        eventSource?.close()
+        eventSource = EventSource(url: eventsURL)
+        
+        eventSource?.onMessage = { [weak self] event in
+            Task { @MainActor in
+                self?.log("Received SSE event")
+                self?.handleSSEEvent(event)
+            }
+        }
+        
+        eventSource?.onError = { [weak self] error in
+            Task { @MainActor in
+                self?.connectionError = error.localizedDescription
+                self?.isConnected = false
+                self?.log("SSE error: \(error.localizedDescription)", level: .error)
+            }
+        }
+        
+        eventSource?.connect()
         isConnected = true
-        connectionState = "Connected (Direct)"
-        
-        // Setup SSE for direct connection
-        setupSSE(baseURL: url)
-        
-        Task {
-            await loadSessions()
+        log("SSE connection established")
+    }
+    
+    private func handleSSEEvent(_ event: ServerSentEvent) {
+        guard let data = event.data?.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let type = json["type"] as? String else {
+            return
         }
-    }
-    
-    // MARK: - Relay Connection (Mac)
-    
-    func startRelayServer() {
-        disconnect()
-        connectionMode = .relay
-        connectionState = "Starting relay..."
-        relayManager?.registerAsMac()
-    }
-    
-    // MARK: - Relay Connection (iPhone)
-    
-    func joinRelayRoom(code: String) {
-        disconnect()
-        connectionMode = .relay
-        roomCode = code
-        connectionState = "Joining room..."
-        relayManager?.joinAsPhone(roomCode: code)
-    }
-    
-    // MARK: - Relay Configuration
-    
-    func updateRelayURL(_ urlString: String) {
-        relayManager?.updateRelayURL(urlString)
-    }
-    
-    func getCurrentRelayURL() -> String {
-        return relayManager?.getCurrentRelayURL() ?? RelayConnectionManager.defaultRelayURL
-    }
-    
-    // MARK: - Common Functions
-    
-    func disconnect() {
-        isConnected = false
-        connectionMode = .none
-        serverURL = nil
-        directClient = nil
-        sessions = []
-        currentSession = nil
-        messages = []
-        connectionState = "Disconnected"
         
-        sseClient?.disconnect()
-        sseClient = nil
-        
-        relayManager?.disconnect()
-    }
-    
-    func loadSessions() async {
-        do {
-            let sessions: [Session]
-            
-            switch connectionMode {
-            case .direct:
-                guard let client = directClient else { return }
-                sessions = try await client.listSessions()
-                
-            case .relay:
-                // For relay, send HTTP request through WebSocket
-                let request = RelayConnectionManager.RelayMessage.HTTPRequest(
-                    id: UUID().uuidString,
-                    method: "GET",
-                    path: "/api/sessions",
-                    headers: nil,
-                    body: nil
-                )
-                
-                // This would need to be async with a completion handler
-                // For now, we'll skip relay session loading
-                return
-                
-            case .none:
-                return
+        switch type {
+        case "session.list":
+            if let sessionsData = json["sessions"] as? [[String: Any]] {
+                updateSessions(from: sessionsData)
             }
-            
-            await MainActor.run {
-                self.sessions = sessions
-                self.error = nil
+        case "session.created", "session.updated":
+            if let sessionData = json["session"] as? [String: Any] {
+                updateSession(from: sessionData)
             }
-        } catch {
-            await MainActor.run {
-                self.error = error.localizedDescription
+        case "session.deleted":
+            if let sessionId = json["sessionId"] as? String {
+                removeSession(id: sessionId)
             }
-        }
-    }
-    
-    func createSession() async {
-        do {
-            let session: Session
-            
-            switch connectionMode {
-            case .direct:
-                guard let client = directClient else { return }
-                session = try await client.createSession()
-                
-            case .relay:
-                // For relay, this would need async handling
-                return
-                
-            case .none:
-                return
-            }
-            
-            await MainActor.run {
-                self.sessions.append(session)
-                self.currentSession = session
-                self.error = nil
-            }
-        } catch {
-            await MainActor.run {
-                self.error = error.localizedDescription
-            }
-        }
-    }
-    
-    func selectSession(_ session: Session) async {
-        currentSession = session
-        await loadMessages()
-        
-        // Setup SSE for this session
-        if connectionMode == .direct, let url = serverURL {
-            setupSSE(baseURL: url, sessionID: session.id)
-        }
-    }
-    
-    func loadMessages() async {
-        do {
-            guard let session = currentSession else { return }
-            let messages: [MessageWithParts]
-            
-            switch connectionMode {
-            case .direct:
-                guard let client = directClient else { return }
-                messages = try await client.listMessages(sessionID: session.id)
-                
-            case .relay:
-                // For relay, this would need async handling
-                return
-                
-            case .none:
-                return
-            }
-            
-            await MainActor.run {
-                self.messages = messages
-                self.error = nil
-            }
-        } catch {
-            await MainActor.run {
-                self.error = error.localizedDescription
-            }
-        }
-    }
-    
-    func sendMessage(_ text: String) async {
-        do {
-            guard let session = currentSession else { return }
-            
-            let request = MessageRequest(
-                messageID: UUID().uuidString,
-                providerID: "anthropic",
-                modelID: "claude-3-5-sonnet-latest",
-                mode: "build",
-                parts: [MessagePart(type: .text, text: text)]
-            )
-            
-            switch connectionMode {
-            case .direct:
-                guard let client = directClient else { return }
-                try await client.sendMessage(sessionID: session.id, message: request)
-                
-            case .relay:
-                // For relay, convert to HTTP request
-                let encoder = JSONEncoder()
-                let body = try encoder.encode(request)
-                let bodyString = String(data: body, encoding: .utf8)
-                
-                let httpRequest = RelayConnectionManager.RelayMessage.HTTPRequest(
-                    id: UUID().uuidString,
-                    method: "POST",
-                    path: "/api/sessions/\(session.id)/messages",
-                    headers: ["Content-Type": "application/json"],
-                    body: bodyString
-                )
-                
-                relayManager?.sendHTTPRequest(httpRequest)
-                
-            case .none:
-                return
-            }
-            
-            await loadMessages()
-        } catch {
-            await MainActor.run {
-                self.error = error.localizedDescription
-            }
-        }
-    }
-    
-    // MARK: - SSE Handling
-    
-    private func setupSSE(baseURL: URL, sessionID: String? = nil) {
-        sseClient?.disconnect()
-        
-        let path = sessionID != nil ? "/api/sessions/\(sessionID!)/events" : "/api/events"
-        guard let sseURL = URL(string: path, relativeTo: baseURL) else { return }
-        
-        sseClient = SSEClient(url: sseURL)
-        
-        sseClient?.delegate = self
-        
-        sseClient?.connect()
-    }
-    
-    private func handleSSEEvent(_ event: SSEEvent) {
-        // Handle different event types
-        switch event.event {
-        case "message":
-            // Refresh messages
-            Task {
-                await loadMessages()
-            }
-            
-        case "session":
-            // Refresh sessions
-            Task {
-                await loadSessions()
-            }
-            
-        default:
-            print("Unhandled SSE event: \(event.event ?? "unknown")")
-        }
-    }
-    
-    // MARK: - Relay Message Handling
-    
-    private func handleRelayMessage(_ message: RelayConnectionManager.RelayMessage) {
-        switch message {
-        case .httpResponse(let response):
-            // Handle HTTP responses from relay
-            handleRelayHTTPResponse(response)
-            
-        case .sseEvent(let event):
-            // Convert relay SSE event to our SSE event
-            let sseEvent = SSEEvent(
-                id: nil,
-                event: event.event,
-                data: event.data,
-                retry: nil
-            )
-            handleSSEEvent(sseEvent)
-            
         default:
             break
         }
     }
     
-    private func handleRelayHTTPResponse(_ response: RelayConnectionManager.RelayMessage.HTTPResponse) {
-        // This would need to be implemented to handle async responses
-        // For now, we'll just log it
-        print("Received HTTP response: \(response.id) - Status: \(response.status)")
+    private func updateSessions(from data: [[String: Any]]) {
+        sessions = data.compactMap { sessionData in
+            guard let id = sessionData["id"] as? String else {
+                return nil
+            }
+            
+            let dateFormatter = ISO8601DateFormatter()
+            let createdAt = sessionData["createdAt"] as? String ?? ""
+            let updatedAt = sessionData["updatedAt"] as? String ?? ""
+            
+            return Session(
+                id: id,
+                title: sessionData["title"] as? String,
+                createdAt: dateFormatter.date(from: createdAt) ?? Date(),
+                updatedAt: dateFormatter.date(from: updatedAt) ?? Date(),
+                parentID: sessionData["parentId"] as? String
+            )
+        }
     }
     
-    private func updateConnectionState(for relayState: RelayConnectionManager.ConnectionState) {
-        switch relayState {
-        case .disconnected:
-            isConnected = false
-            connectionState = "Disconnected"
-        case .connecting:
-            connectionState = "Connecting..."
-        case .connected:
-            connectionState = "Connected to relay"
-        case .registering:
-            connectionState = "Registering..."
-        case .ready:
-            isConnected = true
-            if roomCode != nil {
-                connectionState = "Connected (Relay: \(roomCode!))"
-            } else {
-                connectionState = "Relay ready"
+    private func updateSession(from data: [String: Any]) {
+        guard let id = data["id"] as? String else {
+            return
+        }
+        
+        let dateFormatter = ISO8601DateFormatter()
+        let createdAt = data["createdAt"] as? String ?? ""
+        let updatedAt = data["updatedAt"] as? String ?? ""
+        
+        let session = Session(
+            id: id,
+            title: data["title"] as? String,
+            createdAt: dateFormatter.date(from: createdAt) ?? Date(),
+            updatedAt: dateFormatter.date(from: updatedAt) ?? Date(),
+            parentID: data["parentId"] as? String
+        )
+        
+        if let index = sessions.firstIndex(where: { $0.id == id }) {
+            sessions[index] = session
+        } else {
+            sessions.append(session)
+        }
+    }
+    
+    private func removeSession(id: String) {
+        sessions.removeAll { $0.id == id }
+    }
+    
+    func sendMessage(_ text: String, to session: Session) async {
+        guard let url = URL(string: baseURL) else { return }
+        
+        let messageURL = url.appendingPathComponent("sessions/\(session.id)/messages")
+        var request = URLRequest(url: messageURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        let body = ["content": text, "role": "user"]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            
+            if let httpResponse = response as? HTTPURLResponse,
+               httpResponse.statusCode != 200 {
+                connectionError = "Failed to send message"
+            }
+        } catch {
+            connectionError = error.localizedDescription
+        }
+    }
+    
+    func disconnect() {
+        eventSource?.close()
+        eventSource = nil
+        isConnected = false
+        sessions = []
+        connectionError = nil
+        stopDiscovery()
+    }
+    
+    // MARK: - Discovery Methods
+    
+    private func startDiscovery() {
+        // Initial discovery
+        Task {
+            await discoverInstances()
+        }
+        
+        // Periodic discovery every 5 seconds
+        discoveryTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
+            Task {
+                await self.discoverInstances()
             }
         }
     }
     
-    // MARK: - Auto Connect
+    private func stopDiscovery() {
+        discoveryTimer?.invalidate()
+        discoveryTimer = nil
+    }
     
-    func autoConnect() {
-        log("Starting auto-connect...", level: .info)
+    @MainActor
+    func discoverInstances() async {
+        isDiscovering = true
+        let instances = await OpenCodeDiscovery.discoverRunningInstances()
+        discoveredInstances = instances
+        isDiscovering = false
         
-        // Check saved preferences
-        let savedMode = UserDefaults.standard.string(forKey: "PreferredConnectionMode") ?? "auto"
-        let savedServerURL = UserDefaults.standard.string(forKey: "DirectServerURL") ?? "http://localhost:5173"
-        
-        switch savedMode {
-        case "direct":
-            log("Attempting direct connection to \(savedServerURL)", level: .info)
-            connectDirect(urlString: savedServerURL)
-        case "relay":
-            log("Starting relay connection", level: .info)
-            #if os(macOS)
-            startRelayServer()
-            #else
-            // On iPhone, check if we have a saved room code
-            if let savedRoomCode = UserDefaults.standard.string(forKey: "LastRoomCode") {
-                log("Attempting to rejoin room: \(savedRoomCode)", level: .info)
-                joinRelayRoom(code: savedRoomCode)
-            }
-            #endif
-        default:
-            // Auto mode - try direct first, then relay
-            log("Auto mode: Trying direct connection first", level: .info)
-            attemptAutoConnection(serverURL: savedServerURL)
+        // If we're not connected and found instances, try to connect to the first one
+        if !isConnected && !instances.isEmpty {
+            await connectToFirstAvailableInstance()
         }
     }
     
-    private func attemptAutoConnection(serverURL: String) {
-        // Try direct connection with a timeout
-        connectDirect(urlString: serverURL)
-        
-        // Set a timer to fall back to relay if direct fails
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-            guard let self = self, !self.isConnected else { return }
-            
-            self.log("Direct connection failed, falling back to relay", level: .warning)
-            self.disconnect()
-            
-            #if os(macOS)
-            self.startRelayServer()
-            #else
-            // On iPhone, show settings to enter room code
-            self.log("Please enter a room code in settings", level: .info)
-            #endif
+    func connectToFirstAvailableInstance() async {
+        for instance in discoveredInstances {
+            baseURL = instance.url
+            await connect()
+            if isConnected {
+                break
+            }
         }
+    }
+    
+    func connectToInstance(_ instance: OpenCodeInstance) async {
+        baseURL = instance.url
+        await connect()
     }
     
     // MARK: - Logging
     
-    struct ConnectionLog: Identifiable {
-        let id = UUID()
-        let timestamp = Date()
-        let level: LogLevel
-        let message: String
-        
-        enum LogLevel {
-            case info
-            case warning
-            case error
-            case success
-            
-            var color: Color {
-                switch self {
-                case .info: return .blue
-                case .warning: return .orange
-                case .error: return .red
-                case .success: return .green
-                }
-            }
-        }
-    }
-    
-    func log(_ message: String, level: ConnectionLog.LogLevel = .info) {
-        let log = ConnectionLog(level: level, message: message)
+    private func log(_ message: String, level: LogLevel = .info) {
+        let log = ConnectionLog(timestamp: Date(), level: level, message: message)
         DispatchQueue.main.async {
             self.connectionLogs.append(log)
-            
             // Keep only last 1000 logs
             if self.connectionLogs.count > 1000 {
                 self.connectionLogs.removeFirst(self.connectionLogs.count - 1000)
@@ -459,31 +292,65 @@ class HybridConnectionManager: ObservableObject {
     func clearLogs() {
         connectionLogs.removeAll()
     }
+}
+
+// Simple EventSource implementation
+class EventSource {
+    private let url: URL
+    private var task: URLSessionDataTask?
+    private var session: URLSession
     
-    // MARK: - Session Management
+    var onMessage: ((ServerSentEvent) -> Void)?
+    var onError: ((Error) -> Void)?
     
-    func sendMessage(_ text: String, to session: Session) async {
-        currentSession = session
-        await sendMessage(text)
+    init(url: URL) {
+        self.url = url
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 0
+        config.timeoutIntervalForResource = 0
+        self.session = URLSession(configuration: config)
+    }
+    
+    func connect() {
+        var request = URLRequest(url: url)
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        
+        task = session.dataTask(with: request) { [weak self] data, response, error in
+            if let error = error {
+                self?.onError?(error)
+                return
+            }
+            
+            guard let data = data,
+                  let string = String(data: data, encoding: .utf8) else {
+                return
+            }
+            
+            // Parse SSE data
+            let lines = string.components(separatedBy: "\n")
+            var eventData = ""
+            
+            for line in lines {
+                if line.hasPrefix("data: ") {
+                    eventData = String(line.dropFirst(6))
+                } else if line.isEmpty && !eventData.isEmpty {
+                    let event = ServerSentEvent(data: eventData)
+                    self?.onMessage?(event)
+                    eventData = ""
+                }
+            }
+        }
+        
+        task?.resume()
+    }
+    
+    func close() {
+        task?.cancel()
+        task = nil
     }
 }
 
-// MARK: - SSEClientDelegate
-
-extension HybridConnectionManager: SSEClientDelegate {
-    func sseClient(_ client: SSEClient, didReceiveEvent event: SSEEvent) {
-        handleSSEEvent(event)
-    }
-    
-    func sseClient(_ client: SSEClient, didFailWithError error: Error) {
-        self.error = error.localizedDescription
-    }
-    
-    func sseClientDidConnect(_ client: SSEClient) {
-        // Connection established
-    }
-    
-    func sseClientDidDisconnect(_ client: SSEClient) {
-        // Connection lost
-    }
+struct ServerSentEvent {
+    let data: String?
 }
