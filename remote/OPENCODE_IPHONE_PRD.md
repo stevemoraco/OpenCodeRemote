@@ -221,25 +221,25 @@ OpenCodeiOS/
 
 ## Implementation Phases
 
-### Phase 1: MVP (8 weeks)
+### Phase 1: MVP
 - Basic session list and detail
 - Text-based chat interface
 - Simple authentication
 - Core API integration
 
-### Phase 2: Enhanced Features (6 weeks)
+### Phase 2: Enhanced Features
 - Code diff viewer
 - File browser
 - Push notifications
 - Live Activity widget
 
-### Phase 3: Advanced Features (6 weeks)
+### Phase 3: Advanced Features
 - Multi-server support
 - Voice input
 - Offline mode
 - iPad optimization
 
-### Phase 4: Polish & Scale (4 weeks)
+### Phase 4: Polish & Scale
 - Performance optimization
 - Accessibility audit
 - Localization
@@ -260,7 +260,7 @@ OpenCodeiOS/
 - Battery impact (<5%)
 
 ### Business Impact
-- User retention (30-day)
+- User retention
 - App Store ratings (>4.5)
 - Support ticket volume
 - Feature request patterns
