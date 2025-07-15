@@ -11,42 +11,42 @@ class OpenCodeDiscovery {
     static func discoverRunningInstances() async -> [OpenCodeInstance] {
         var instances: [OpenCodeInstance] = []
         
-        // Method 1: Scan a wider range of ports since OpenCode uses dynamic ports
-        // OpenCode seems to use ports in the 50000+ range
-        let portRanges = [
-            // Common development ports
-            3000...3010,
-            4000...4010,
-            5000...5010,
-            8000...8010,
-            // Higher port range where OpenCode typically runs
-            50000...52000
-        ]
+        // First check the most common OpenCode ports
+        let priorityPorts = [51330, 51896, 4096, 5173]
         
-        // Use concurrent checking for better performance
-        await withTaskGroup(of: OpenCodeInstance?.self) { group in
-            for range in portRanges {
-                for port in range {
-                    group.addTask {
-                        if await isOpenCodeRunning(at: port) {
-                            print("Found OpenCode instance on port \(port)")
-                            return OpenCodeInstance(port: port, pid: 0, url: "http://localhost:\(port)")
+        for port in priorityPorts {
+            if let instance = await checkSpecificPort(port) {
+                instances.append(instance)
+            }
+        }
+        
+        // If no instances found, scan a limited range
+        if instances.isEmpty {
+            // Scan a smaller range around common ports
+            let portRanges = [
+                51300...51400,  // Around where OpenCode typically runs
+                5170...5180,
+                4090...4100
+            ]
+            
+            // Use concurrent checking for better performance
+            await withTaskGroup(of: OpenCodeInstance?.self) { group in
+                for range in portRanges {
+                    for port in range {
+                        group.addTask {
+                            if await isOpenCodeRunning(at: port) {
+                                print("Found OpenCode instance on port \(port)")
+                                return OpenCodeInstance(port: port, pid: 0, url: "http://localhost:\(port)")
+                            }
+                            return nil
                         }
-                        return nil
                     }
                 }
-            }
-            
-            // Limit concurrent tasks to avoid overwhelming the system
-            var taskCount = 0
-            for await instance in group {
-                if let instance = instance {
-                    instances.append(instance)
-                }
-                taskCount += 1
-                if taskCount % 100 == 0 {
-                    // Small delay every 100 ports to avoid too many concurrent connections
-                    try? await Task.sleep(nanoseconds: 10_000_000) // 10ms
+                
+                for await instance in group {
+                    if let instance = instance {
+                        instances.append(instance)
+                    }
                 }
             }
         }
@@ -66,10 +66,16 @@ class OpenCodeDiscovery {
         // Try the /app endpoint which returns app info
         let url = URL(string: "http://localhost:\(port)/app")!
         var request = URLRequest(url: url)
-        request.timeoutInterval = 0.5 // Faster timeout for port scanning
+        request.timeoutInterval = 0.3 // Very fast timeout for port scanning
+        
+        // Create a custom session with shorter timeouts
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 0.3
+        config.timeoutIntervalForResource = 0.3
+        let session = URLSession(configuration: config)
         
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await session.data(for: request)
             if let httpResponse = response as? HTTPURLResponse,
                httpResponse.statusCode == 200 {
                 // OpenCode's /app endpoint returns JSON with hostname, time, git, path fields
