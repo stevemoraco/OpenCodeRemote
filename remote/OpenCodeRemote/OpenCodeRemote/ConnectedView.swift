@@ -8,9 +8,9 @@ struct ConnectedView: View {
     @State private var messageText = ""
     
     var body: some View {
-        NavigationSplitView {
+        HStack(spacing: 0) {
             // Sidebar with sessions
-            VStack {
+            VStack(spacing: 0) {
                 // Connection Status Header
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
@@ -53,6 +53,7 @@ struct ConnectedView: View {
                 // Sessions List
                 if connectionManager.sessions.isEmpty {
                     VStack(spacing: 20) {
+                        Spacer()
                         Image(systemName: "bubble.left.and.bubble.right")
                             .font(.system(size: 50))
                             .foregroundColor(.gray)
@@ -62,8 +63,9 @@ struct ConnectedView: View {
                         Button("New Session") {
                             showingNewSession = true
                         }
+                        Spacer()
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(maxWidth: .infinity)
                 } else {
                     List(connectionManager.sessions, selection: $selectedSession) { session in
                         SessionRow(session: session)
@@ -92,9 +94,12 @@ struct ConnectedView: View {
                 }
                 .padding()
             }
-            .frame(minWidth: 250)
-            .navigationTitle("Sessions")
-        } detail: {
+            .frame(width: 300)
+            .background(Color(NSColor.controlBackgroundColor))
+            
+            Divider()
+            
+            // Detail view
             if let session = selectedSession {
                 SessionDetailView(
                     session: session,
@@ -109,16 +114,14 @@ struct ConnectedView: View {
                         .font(.title2)
                         .foregroundColor(.secondary)
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         .sheet(isPresented: $showingNewSession) {
             NewSessionView(connectionManager: connectionManager)
         }
-        .onAppear {
-            // Start fetching sessions
-            Task {
-                await connectionManager.fetchSessions()
-            }
+        .task {
+            await connectionManager.fetchSessions()
         }
     }
 }
@@ -153,29 +156,42 @@ struct SessionDetailView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Header
-            VStack(alignment: .leading, spacing: 8) {
-                Text(session.title ?? "Untitled Session")
-                    .font(.title2)
-                    .fontWeight(.semibold)
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(session.title ?? "Untitled Session")
+                        .font(.title2)
+                        .fontWeight(.semibold)
+                    
+                    Text("Session ID: \(session.id)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
                 
-                Text("Session ID: \(session.id)")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                Spacer()
+                
+                Button(action: {
+                    Task {
+                        await connectionManager.deleteSession(session)
+                    }
+                }) {
+                    Label("Delete", systemImage: "trash")
+                        .foregroundColor(.red)
+                }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
             .padding()
             
             Divider()
             
             // Messages
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 12) {
                     ForEach(messages) { message in
                         MessageView(message: message)
                     }
                 }
                 .padding()
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             
             Divider()
             
@@ -195,18 +211,6 @@ struct SessionDetailView: View {
                 .disabled(messageText.isEmpty)
             }
             .padding()
-        }
-        .navigationTitle(session.title ?? "Session")
-        .toolbar {
-            ToolbarItem(placement: .automatic) {
-                Button(action: {
-                    Task {
-                        await connectionManager.deleteSession(session)
-                    }
-                }) {
-                    Label("Delete Session", systemImage: "trash")
-                }
-            }
         }
         .onAppear {
             loadMessages()
@@ -305,35 +309,43 @@ struct NewSessionView: View {
     @State private var sessionTitle = ""
     
     var body: some View {
-        NavigationView {
-            Form {
-                Section("Session Details") {
-                    TextField("Session Title (optional)", text: $sessionTitle)
-                }
-                
-                Section {
-                    Text("A new session will be created with the current context.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+        VStack(spacing: 20) {
+            Text("New Session")
+                .font(.title2)
+                .fontWeight(.semibold)
+            
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Session Title")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                TextField("Enter title (optional)", text: $sessionTitle)
+                    .textFieldStyle(RoundedBorderTextFieldStyle())
             }
-            .navigationTitle("New Session")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
+            
+            Text("A new session will be created with the current context.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            
+            Spacer()
+            
+            HStack(spacing: 16) {
+                Button("Cancel") {
+                    dismiss()
+                }
+                .keyboardShortcut(.escape)
+                
+                Button("Create") {
+                    Task {
+                        await connectionManager.createSession(title: sessionTitle.isEmpty ? nil : sessionTitle)
                         dismiss()
                     }
                 }
-                
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Create") {
-                        Task {
-                            await connectionManager.createSession(title: sessionTitle.isEmpty ? nil : sessionTitle)
-                            dismiss()
-                        }
-                    }
-                }
+                .keyboardShortcut(.return)
+                .buttonStyle(.borderedProminent)
             }
         }
+        .padding()
+        .frame(width: 400, height: 250)
     }
 }
