@@ -11,35 +11,8 @@ struct ContentView: View {
     var body: some View {
         VStack {
             if connectionManager.isConnected {
-                // Connected view
-                VStack {
-                    Text("Connected to OpenCode")
-                        .font(.headline)
-                        .padding()
-                    
-                    Text(connectionManager.baseURL)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    
-                    // Show sessions
-                    if !connectionManager.sessions.isEmpty {
-                        List(connectionManager.sessions) { session in
-                            VStack(alignment: .leading) {
-                                Text(session.title ?? "Untitled Session")
-                                    .font(.headline)
-                                Text("ID: \(session.id)")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                            .padding(.vertical, 4)
-                        }
-                    }
-                    
-                    Button("Disconnect") {
-                        connectionManager.disconnect()
-                    }
-                    .padding()
-                }
+                // Use the new comprehensive connected view
+                ConnectedView(connectionManager: connectionManager)
             } else {
                 // Not connected view
                 VStack(spacing: 20) {

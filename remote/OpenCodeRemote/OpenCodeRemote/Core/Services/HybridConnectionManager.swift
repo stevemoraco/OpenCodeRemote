@@ -195,11 +195,70 @@ class HybridConnectionManager: ObservableObject {
         sessions.removeAll { $0.id == id }
     }
     
-    func sendMessage(_ text: String, to session: Session) async {
-        guard let url = URL(string: baseURL) else { return }
+    func fetchSessions() async {
+        guard let url = URL(string: "\(baseURL)/api/session") else { return }
         
-        let messageURL = url.appendingPathComponent("sessions/\(session.id)/messages")
-        var request = URLRequest(url: messageURL)
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let sessionsData = json["sessions"] as? [[String: Any]] {
+                await MainActor.run {
+                    updateSessions(from: sessionsData)
+                }
+            }
+        } catch {
+            log("Failed to fetch sessions: \(error.localizedDescription)", level: .error)
+        }
+    }
+    
+    func createSession(title: String?) async {
+        guard let url = URL(string: "\(baseURL)/api/session") else { return }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        
+        let body: [String: Any] = title != nil ? ["title": title!] : [:]
+        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            
+            if let httpResponse = response as? HTTPURLResponse,
+               httpResponse.statusCode == 200 || httpResponse.statusCode == 201 {
+                log("Session created successfully")
+                await fetchSessions()
+            }
+        } catch {
+            log("Failed to create session: \(error.localizedDescription)", level: .error)
+        }
+    }
+    
+    func deleteSession(_ session: Session) async {
+        guard let url = URL(string: "\(baseURL)/api/session/\(session.id)") else { return }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "DELETE"
+        
+        do {
+            let (_, response) = try await URLSession.shared.data(for: request)
+            
+            if let httpResponse = response as? HTTPURLResponse,
+               httpResponse.statusCode == 200 || httpResponse.statusCode == 204 {
+                log("Session deleted successfully")
+                await MainActor.run {
+                    sessions.removeAll { $0.id == session.id }
+                }
+            }
+        } catch {
+            log("Failed to delete session: \(error.localizedDescription)", level: .error)
+        }
+    }
+    
+    func sendMessage(_ text: String, to session: Session) async {
+        guard let url = URL(string: "\(baseURL)/api/session/\(session.id)/message") else { return }
+        
+        var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         
